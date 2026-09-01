@@ -2792,6 +2792,25 @@ _JS_SCOPE_BOUNDARY = frozenset({
     "generator_function_declaration",
 })
 
+def _js_identifier_reads(node, source: bytes, out: set) -> None:
+    """Collect the names an expression READS.
+
+    `a.b` reads `a` — `b` is a field of it, not a binding in scope — so member
+    expressions contribute only their object. Used to turn a Svelte `$derived`
+    initializer into the set of state it recomputes from.
+    """
+    if node is None:
+        return
+    if node.type == "identifier":
+        out.add(_read_text(node, source))
+        return
+    if node.type == "member_expression":
+        _js_identifier_reads(node.child_by_field_name("object"), source, out)
+        return
+    for c in node.children:
+        _js_identifier_reads(c, source, out)
+
+
 def _js_collect_pattern_idents(node, source: bytes, bound: set) -> None:
     """Collect binding identifier names from a JS/TS pattern (a parameter, or a
     declarator LHS). Recurses through destructuring (object/array patterns, rest)
@@ -2803,8 +2822,16 @@ def _js_collect_pattern_idents(node, source: bytes, bound: set) -> None:
         return
     if t == "type_annotation":
         return  # `(h: Handler)` — Handler is a type, not a bound name
-    if t == "assignment_pattern":  # `x = default` — only x is bound
+    # `x = default` — only x is bound. An OBJECT pattern spells this
+    # `object_assignment_pattern`, which this branch did not name, so
+    # `{ index = bind() }` fell through to the generic recursion below and bound
+    # the callee `bind` — exactly the default-value side this function promises
+    # never to walk. Svelte 5 writes that shape in every component
+    # (`let { index = $bindable() } = $props()`).
+    if t in ("assignment_pattern", "object_assignment_pattern"):
         left = node.child_by_field_name("left")
+        if left is None:  # object_assignment_pattern exposes no `left` field
+            left = node.named_children[0] if node.named_children else None
         if left is not None:
             _js_collect_pattern_idents(left, source, bound)
         return
@@ -4898,12 +4925,90 @@ def _js_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
                                 add_edge_fn(file_nid, prop_nid, "contains", line)
                             const_found = True
                         elif name_node:
-                            const_name = _read_text(name_node, source)
                             line = child.start_point[0] + 1
-                            const_nid = _decl(_make_id(stem, const_name), const_name,
-                                              "var", const_name, line)
-                            add_edge_fn(file_nid, const_nid, "contains", line)
-                            const_found = True
+                            if name_node.type in ("object_pattern", "array_pattern"):
+                                # A destructuring declaration binds N names, so it
+                                # nodes N times. `_read_text` on the pattern returns
+                                # the whole `{ a, b = 1, c: local }` text, which is
+                                # useless as a label and as an id, and hides every
+                                # binding inside it. Svelte 5 makes this the normal
+                                # shape of a component's public surface — every
+                                # component writes `let { ... } = $props()`.
+                                # `_js_collect_pattern_idents` already walks these
+                                # patterns for scope tracking: it recurses nested
+                                # destructuring, takes the left of `x = default`, the
+                                # local name of `{ a: local }`, and skips type
+                                # annotations.
+                                # `const { doWork } = require('./lib')` destructures
+                                # an IMPORT, not a declaration: the binding refers to
+                                # an entity another file defines. Noding it here mints
+                                # a local rival that steals the cross-file `calls`
+                                # edge from the real definition, so leave requires to
+                                # the CJS import branch above.
+                                req = value
+                                while req is not None and req.type in (
+                                        "as_expression", "satisfies_expression"):
+                                    req = (req.named_children[0]
+                                           if req.named_children else None)
+                                if req is not None and req.type == "call_expression":
+                                    callee = req.child_by_field_name("function")
+                                    if (callee is not None
+                                            and _read_text(callee, source) == "require"):
+                                        continue
+                                bound: set[str] = set()
+                                _js_collect_pattern_idents(name_node, source, bound)
+                                for bname in sorted(bound):
+                                    # Same guard as the arrow branch: a name that
+                                    # normalizes to nothing would collapse the id to
+                                    # the file stem and leak the scan path (#1899).
+                                    if not normalize_id(bname):
+                                        continue
+                                    bnid = _decl(_make_id(stem, bname), bname,
+                                                 "var", bname, line)
+                                    add_edge_fn(file_nid, bnid, "contains", line)
+                                    const_found = True
+                                # No single binding owns a closure passed to the
+                                # initializer, so the module does.
+                                const_nid = file_nid
+                            else:
+                                const_name = _read_text(name_node, source)
+                                const_nid = _decl(_make_id(stem, const_name), const_name,
+                                                  "var", const_name, line)
+                                add_edge_fn(file_nid, const_nid, "contains", line)
+                                const_found = True
+                                # A Svelte 5 `$derived(expr)` states WHICH state the
+                                # value recomputes from — intra-component data flow
+                                # that no import, call or containment edge records.
+                                # Modelled the way Riverpod providers already are in
+                                # `extractors/dart.py`: the existing `references`
+                                # relation carrying a `context` discriminator, rather
+                                # than a new relation name.
+                                rune = value
+                                while rune is not None and rune.type in (
+                                        "as_expression", "satisfies_expression"):
+                                    rune = (rune.named_children[0]
+                                            if rune.named_children else None)
+                                if rune is not None and rune.type == "call_expression":
+                                    fn = rune.child_by_field_name("function")
+                                    fname = _read_text(fn, source) if fn is not None else ""
+                                    if fname in ("$derived", "$derived.by"):
+                                        reads: set[str] = set()
+                                        _js_identifier_reads(
+                                            rune.child_by_field_name("arguments"),
+                                            source, reads)
+                                        for dep in sorted(reads):
+                                            if dep == const_name:
+                                                continue
+                                            dep_nid = _make_id(stem, dep)
+                                            # Only link state this file already noded.
+                                            # A dependency declared BELOW the derived
+                                            # value is not yet seen and is skipped —
+                                            # Svelte requires state before use, so
+                                            # this costs little and never dangles.
+                                            if dep_nid in seen_ids:
+                                                add_edge_fn(const_nid, dep_nid,
+                                                            "references", line,
+                                                            context="svelte_rune")
                             # #2552: `const handler = wrapper(async (req) => …)`
                             # created the const node above but, unlike the arrow
                             # branch, never tracked the callback's body — so
@@ -6457,6 +6562,8 @@ def _extract_generic(
     nodes: list[dict] = []
     edges: list[dict] = []
     seen_ids: set[str] = set()
+    # Label recorded under each minted id, so `add_node` can tell a symbol seen
+    # twice (harmless) from two DISTINCT declarations whose ids collapsed.
     namespace_stack: list[str] = []
     # Ruby only: enclosing module/class segments, so `module Foo::Bar` (compact)
     # and `module Foo; module Bar` (nested) label the same node `Foo::Bar` and
