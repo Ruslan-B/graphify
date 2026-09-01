@@ -138,6 +138,7 @@ from graphify.extractors.resolution import (  # noqa: E402,F401
     _ts_collect_type_refs,
     _ts_heritage_clause_entries,
     _ts_walk_class_members,
+    _astro_mask_non_code,
     _vue_mask_non_script,
     _walk_js_tree,
     _walk_python_tree,
@@ -1687,10 +1688,30 @@ def extract_svelte(path: Path) -> dict:
     {#await import('./X.svelte')} lives in the markup layer and is invisible
     to the JS parser, so a regex pass covers those dynamic imports.
     """
-    result = _extract_generic(path, _JS_CONFIG)
+    # A Svelte file is a container in the same shape as a Vue SFC, and
+    # `_vue_mask_non_script` is not Vue-specific — its regex matches any
+    # `<script ...>...</script>`. Masking the template away lets the grammar see
+    # a valid module, so declarations in the script become nodes instead of
+    # dying with the whole-file ERROR node. The regex rescue below still runs for
+    # the dynamic imports that live in template syntax.
+    try:
+        _src_for_mask = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        _src_for_mask = ""
+    _masked_src, _lang = _vue_mask_non_script(_src_for_mask)
+    if _lang == "tsx":
+        _cfg = _TSX_CONFIG
+    elif _lang in ("js", "jsx"):
+        _cfg = _JS_CONFIG
+    else:  # "ts" or unspecified — TS is a superset of JS, so it is safe here
+        _cfg = _TS_CONFIG
+    _masked = _masked_src.encode("utf-8")
+    if _cfg in (_TS_CONFIG, _TSX_CONFIG):
+        _masked = _normalize_ts_import_types(_masked) or _masked
+    result = _extract_generic(path, _cfg, source_override=_masked)
     try:
         import re as _re
-        src = path.read_text(encoding="utf-8", errors="replace")
+        src = _src_for_mask
         existing_ids = {n["id"] for n in result.get("nodes", [])}
         # Source file node ID must match the one _extract_generic creates:
         # _make_id(str(path)) - single arg, no stem prefix. Otherwise the source
@@ -1749,10 +1770,22 @@ def extract_astro(path: Path) -> dict:
     approach, scanning the frontmatter block and any client-side ``<script>`` blocks
     for static and dynamic imports.
     """
-    result = _extract_generic(path, _JS_CONFIG)
+    # The frontmatter IS TypeScript. Feeding the whole file to the JS grammar
+    # errors at the template and loses every symbol declared up there, so mask
+    # the template away first and parse what is left with the TS grammar — the
+    # same masking `extract_vue` uses for SFCs. The regex rescue below still
+    # runs: it recovers client-side `<script>` imports and dynamic imports the
+    # AST does not edge.
+    try:
+        _src_for_mask = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        _src_for_mask = ""
+    _masked = _astro_mask_non_code(_src_for_mask).encode("utf-8")
+    _masked = _normalize_ts_import_types(_masked) or _masked
+    result = _extract_generic(path, _TS_CONFIG, source_override=_masked)
     try:
         import re as _re
-        src = path.read_text(encoding="utf-8", errors="replace")
+        src = _src_for_mask
         existing_ids = {n["id"] for n in result.get("nodes", [])}
         file_node_id = _make_id(str(path))
         aliases = _load_tsconfig_aliases(path.parent)

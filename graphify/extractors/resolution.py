@@ -640,6 +640,46 @@ def _vue_mask_non_script(src: str) -> tuple[str, str | None]:
     out.append(_blank(src[pos:]))
     return "".join(out), lang
 
+_ASTRO_FRONTMATTER_RE = re.compile(r"\A---[^\n]*\n(.*?)\n---[ \t]*(?:\n|\Z)", re.S)
+
+def _astro_mask_non_code(src: str) -> str:
+    """Blank everything outside an Astro file's code, keeping newlines.
+
+    An Astro file has TWO code regions and both must survive: the
+    ``---...---`` frontmatter, which is TypeScript run at build time, and any
+    ``<script>`` blocks, which are JS run in the browser. Masking only the
+    frontmatter silently drops every client-side function — measured on realms,
+    that alone lost 30 edges, among them
+    ``UserMenu.astro contains renderSignIn()`` and ``doSave() calls close()``.
+
+    Preserved newlines keep ``source_location`` accurate against the original
+    file. A file with neither region masks to blanks, which parses as an empty
+    module rather than erroring.
+    """
+    def _blank(s: str) -> str:
+        return re.sub(r"[^\r\n]", " ", s)
+
+    keep: list[tuple[int, int]] = []
+    m = _ASTRO_FRONTMATTER_RE.match(src)
+    if m:
+        keep.append((m.start(1), m.end(1)))
+    for sm in _VUE_SCRIPT_RE.finditer(src):
+        keep.append((sm.start(2), sm.end(2)))
+    if not keep:
+        return _blank(src)
+
+    keep.sort()
+    out: list[str] = []
+    pos = 0
+    for start, end in keep:
+        if start < pos:  # overlapping regions cannot both be kept verbatim
+            continue
+        out.append(_blank(src[pos:start]))
+        out.append(src[start:end])
+        pos = end
+    out.append(_blank(src[pos:]))
+    return "".join(out)
+
 def _source_key(source_file: str, root: Path) -> str:
     if not source_file:
         return ""

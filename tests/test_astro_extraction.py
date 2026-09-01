@@ -141,3 +141,71 @@ import Hero from '@components/Hero.astro';
     result = extract_astro(page)
     targets = _import_targets(result, relation="imports_from")
     assert _make_id(str(hero)) in targets
+
+
+def test_astro_frontmatter_symbols_are_extracted_with_correct_lines(tmp_path):
+    """The frontmatter IS TypeScript, so its declarations should reach the graph.
+
+    Before this, the whole file went to the JS grammar, errored at the template,
+    and only imports were rescued by regex. `extract_vue` already solves the same
+    shape by masking the non-script regions and handing the rest to
+    `_extract_generic` via `source_override`.
+
+    Asserts the declarations graphify actually models: a literal `const` is
+    deliberately not a node (measured), a call-initialised one is.
+    """
+    comp = _write(
+        tmp_path / "Page.astro",
+        """---
+import { defineThing } from './lib'
+
+interface Props { id: number }
+
+const thing = defineThing(1)
+
+function greet(name: string): string {
+  return 'hi ' + name
+}
+---
+<div>{greet('x')}</div>
+""",
+    )
+    result = extract_astro(comp)
+    by_label = {n["label"]: n for n in result["nodes"]}
+    assert "Props" in by_label
+    assert "thing" in by_label
+    assert "greet()" in by_label
+    # Masking must preserve line numbers: these are lines of the .astro file.
+    assert by_label["Props"]["source_location"] == "L4"
+    assert by_label["thing"]["source_location"] == "L6"
+    assert by_label["greet()"]["source_location"] == "L8"
+
+
+def test_astro_keeps_client_script_symbols_as_well_as_frontmatter(tmp_path):
+    """An Astro file has TWO code regions, and masking must keep both.
+
+    The frontmatter runs at build time; a `<script>` block runs in the browser.
+    Masking only the frontmatter silently drops every client-side function —
+    measured on realms, that lost 30 edges including
+    `UserMenu.astro contains renderSignIn()` and `doSave() calls close()`.
+    """
+    comp = _write(
+        tmp_path / "Menu.astro",
+        """---
+interface Props { id: number }
+---
+<div id="menu"></div>
+<script>
+  function renderSignIn() {
+    close()
+  }
+  function close() {}
+</script>
+""",
+    )
+    result = extract_astro(comp)
+    by_label = {n["label"]: n for n in result["nodes"]}
+    assert "Props" in by_label, "frontmatter symbol lost"
+    assert "renderSignIn()" in by_label, "client script symbol lost"
+    assert "close()" in by_label
+    assert by_label["renderSignIn()"]["source_location"] == "L6"
