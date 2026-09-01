@@ -113,12 +113,30 @@ def global_add(source_path: Path, repo_tag: str) -> dict:
     except TypeError:
         src_G = _jg.node_link_graph(data)
 
-    # Prefix IDs for cross-project isolation
-    prefixed = prefix_graph_for_global(src_G, repo_tag)
-
-    # Load global graph and prune stale nodes for this repo
+    # Load and prune BEFORE prefixing: the community offset has to be derived
+    # from what remains, so re-adding the same repo reuses its own id range
+    # instead of climbing on every run.
     G = _load_global_graph()
     removed = prune_repo_from_graph(G, repo_tag)
+
+    # Offset this repo's community ids into the shared id space. Every input
+    # graph numbers its communities from 0, so ids carried across a merge
+    # unchanged collide and the aggregated community view fuses unrelated
+    # communities into one meta-node (#3014). `merge-graphs` offsets them
+    # (cli.py passes an accumulating community_offset); this path did not, so a
+    # 7-repo global graph carried 210 ids for 14,936 nodes -- the count of its
+    # largest single repo -- with 209 of them holding nodes from several repos.
+    existing_cids = [
+        d["community"]
+        for _, d in G.nodes(data=True)
+        if isinstance(d.get("community"), int)
+    ]
+    community_offset = max(existing_cids) + 1 if existing_cids else 0
+
+    # Prefix IDs for cross-project isolation
+    prefixed = prefix_graph_for_global(
+        src_G, repo_tag, community_offset=community_offset
+    )
 
     # Merge external-library nodes (no source_file) by label to avoid duplication
     external_labels = {

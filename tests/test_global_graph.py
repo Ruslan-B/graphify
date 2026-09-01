@@ -385,3 +385,45 @@ def test_global_add_rejects_oversized_source_graph(monkeypatch, tmp_path):
         from graphify.global_graph import global_add
         with pytest.raises(ValueError, match="exceeds"):
             global_add(src_graph, "repoA")
+
+
+def test_global_add_offsets_community_ids_per_repo(tmp_path):
+    """Two repos merged into the global graph must not share community ids.
+
+    Every input graph numbers its communities from 0, so ids carried across a
+    merge unchanged collide and the aggregated community view fuses unrelated
+    communities into one meta-node (#3014). `merge-graphs` already offsets them
+    (`cli.py` passes an accumulating `community_offset`); `global_add` calls
+    `prefix_graph_for_global` without one, so it does not.
+
+    Measured on a real workspace: 7 repos merged via `global add` produced 210
+    community ids for 14,936 nodes -- exactly the count of the largest single
+    repo -- and 209 of those 210 ids held nodes from more than one repo, with
+    one id claiming four unrelated names at once.
+    """
+    a = tmp_path / "a.json"
+    _graph_to_json(_make_graph([
+        {"id": "alpha", "label": "alpha", "source_file": "src/a.ts", "community": 0},
+        {"id": "beta", "label": "beta", "source_file": "src/b.ts", "community": 1},
+    ]), a)
+    b = tmp_path / "b.json"
+    _graph_to_json(_make_graph([
+        {"id": "gamma", "label": "gamma", "source_file": "src/g.ts", "community": 0},
+        {"id": "delta", "label": "delta", "source_file": "src/d.ts", "community": 1},
+    ]), b)
+
+    global_dir = tmp_path / ".graphify"
+    with patch("graphify.global_graph._GLOBAL_DIR", global_dir), \
+         patch("graphify.global_graph._GLOBAL_GRAPH", global_dir / "global-graph.json"), \
+         patch("graphify.global_graph._GLOBAL_MANIFEST", global_dir / "global-manifest.json"):
+        from graphify.global_graph import global_add, _load_global_graph
+        global_add(a, "repoA")
+        global_add(b, "repoB")
+        G = _load_global_graph()
+
+    per_repo: dict[str, set] = {}
+    for _, d in G.nodes(data=True):
+        per_repo.setdefault(d.get("repo"), set()).add(d.get("community"))
+    assert per_repo["repoA"].isdisjoint(per_repo["repoB"]), (
+        f"community ids collide across repos: {per_repo}"
+    )
