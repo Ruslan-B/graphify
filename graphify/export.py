@@ -251,6 +251,42 @@ def _git_head(cwd: "str | Path | None" = None) -> str | None:
         return None
 
 
+def _built_by() -> str:
+    """Identify the build writing this graph: ``graphifyy <version>[ (<rev>)]``.
+
+    ``built_at_commit`` names the commit of the repo being SCANNED. Nothing named
+    the extractor, so a graph written by a working checkout and one written by the
+    released wheel were byte-indistinguishable — and an extractor change (a new
+    construct reached, a resolution rule fixed) silently makes every existing
+    ``graphify-out/`` stale with no way to tell which side of the change it is on.
+
+    The revision is read from the tree the *package* was imported from, not the
+    caller's cwd and not the scanned repo: an editable install points at a
+    checkout that moves independently of both. A release install has no work tree
+    there, so the stamp degrades to the bare version, which is the whole
+    distinction being drawn.
+    """
+    try:
+        from importlib.metadata import version as _v
+        base = f"graphifyy {_v('graphifyy')}"
+    except Exception:
+        base = "graphifyy unknown"
+    pkg_dir = Path(__file__).resolve().parent
+    head = _git_head(pkg_dir)
+    if not head:
+        return base
+    import subprocess as _sp
+    dirty = ""
+    try:
+        r = _sp.run(["git", "status", "--porcelain"], capture_output=True,
+                    text=True, timeout=3, cwd=str(pkg_dir))
+        if r.returncode == 0 and r.stdout.strip():
+            dirty = "-dirty"
+    except Exception:
+        pass
+    return f"{base} ({head[:7]}{dirty})"
+
+
 # Sentinel: an existing graph.json is present and non-empty but cannot be parsed
 # into a node count (corrupt, mid-write, or structurally wrong). The caller must
 # fail CLOSED on this — the same way to_json's #479 guard refuses to overwrite
@@ -515,6 +551,8 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
     commit = built_at_commit if built_at_commit is not None else _git_head(Path(output_path).resolve().parent)
     if commit:
         data["built_at_commit"] = commit
+    # ...and the build that produced it, which `built_at_commit` does not name.
+    data["built_by"] = _built_by()
     from graphify.paths import write_json_atomic
     # Atomic write: a crash/ENOSPC mid-write must not truncate a good graph.json.
     write_json_atomic(output_path, data, compact=True)

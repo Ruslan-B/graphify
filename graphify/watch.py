@@ -1573,7 +1573,13 @@ def _node_community_map(graph_data: dict) -> dict[str, int]:
 
 def _canonical_graph_for_compare(graph_data: dict) -> dict:
     canonical = dict(graph_data)
+    # Provenance, not topology: these say WHO built the graph and from WHERE,
+    # and both move without a single node or edge changing - `built_by` on any
+    # upgrade or checkout switch, `built_at_commit` on every commit to the
+    # scanned repo. Left in, they defeat the unchanged-graph early return on the
+    # first rebuild after either.
     canonical.pop("built_at_commit", None)
+    canonical.pop("built_by", None)
     # A missing "directed" key means the same thing as "directed": false
     # everywhere else in the codebase (#2342's --no-cluster path only started
     # writing the key once it began inheriting it from the existing graph).
@@ -1592,7 +1598,13 @@ def _canonical_graph_for_compare(graph_data: dict) -> dict:
 
 def _canonical_topology_for_compare(graph_data: dict) -> dict:
     canonical = dict(graph_data)
+    # Provenance, not topology: these say WHO built the graph and from WHERE,
+    # and both move without a single node or edge changing - `built_by` on any
+    # upgrade or checkout switch, `built_at_commit` on every commit to the
+    # scanned repo. Left in, they defeat the unchanged-graph early return on the
+    # first rebuild after either.
     canonical.pop("built_at_commit", None)
+    canonical.pop("built_by", None)
 
     # The on-disk graph.json carries format/version provenance under "graph"
     # (schema_version, graphify_version — #4167) that the candidate topology,
