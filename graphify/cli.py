@@ -2725,6 +2725,11 @@ def dispatch_command(cmd: str) -> None:
         # solely in the slot historic readers ignored (#2485). Mirror to_json's
         # dual-slot shape so every writer agrees.
         out_data["hyperedges"] = merged.graph.get("hyperedges", [])
+        # Same reason as the line above: mirror what to_json writes. The merged
+        # graph is what an MCP server is usually pointed at, so it is the artifact
+        # most in need of naming the build that produced it.
+        from graphify.export import _built_by as _bb
+        out_data["built_by"] = _bb()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         from graphify.paths import write_json_atomic as _wja
         _wja(out_path, out_data, indent=2)
