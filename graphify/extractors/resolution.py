@@ -1875,13 +1875,25 @@ def _apply_symbol_resolution_facts(
         if unresolved_origin is not None:
             origin_path, origin_symbol = resolve_exported_origin(*unresolved_origin)
             target_id = symbol_nodes.get((origin_path, origin_symbol))
-        if target_id is None and use_fact.relation in ("inherits", "implements"):
-            # Same-file fallback for HERITAGE only: a base declared in the same
-            # file (`class X extends Y`, `interface A extends B`) has no import
-            # alias, so resolve it directly against the file's own symbol nodes.
-            # Scoped to heritage because same-file calls/uses already resolve via
-            # the dedicated call-graph pass; widening this would duplicate those
-            # edges. Import resolution still takes precedence (#1095).
+        if target_id is None and (
+            use_fact.relation in ("inherits", "implements")
+            or (use_fact.relation == "references"
+                and use_fact.context in _SAME_FILE_TYPE_CONTEXTS)
+        ):
+            # Same-file fallback for heritage and TYPE POSITIONS: a name declared
+            # in the same file (`class X extends Y`, `interface A extends B`,
+            # `photo: Photo`) has no import alias, so resolve it directly against
+            # the file's own symbol nodes.
+            #
+            # Heritage was the original scope, on the reasoning that same-file
+            # calls/uses already resolve via the dedicated call-graph pass and
+            # widening this would duplicate those edges (#1095). That holds for
+            # calls, which the call-graph pass does handle — and not for type
+            # positions, which it does not, so a field, parameter or return type
+            # naming a type from its own module was dropped outright. Measured on
+            # a TS monorepo: 157 of 214 field type references, 73%. Rust resolves
+            # the same-file case, so the two languages disagreed on identical
+            # declarations. Import resolution still takes precedence.
             target_id = symbol_nodes.get((file_path, use_fact.local_name))
         if target_id is None:
             continue
@@ -2220,6 +2232,15 @@ def _ts_heritage_clause_entries(clause_node, source: bytes) -> list[str]:
             if text:
                 out.append(text)
     return out
+
+# Contexts in which a `references` use names a TYPE rather than a value. The
+# call-graph pass resolves same-file value uses; it never looks at type
+# positions, so these need the same-file fallback that heritage already had.
+_SAME_FILE_TYPE_CONTEXTS = frozenset({
+    "field", "parameter_type", "return_type", "generic_arg", "type_lookup",
+    "variable_type", "typedef",
+})
+
 
 def _ts_collect_type_refs(node, source: bytes, generic: bool, out: list[tuple[str, str]]) -> None:
     """Walk a TS type annotation tree; append (name, role) tuples.
