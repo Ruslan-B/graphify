@@ -79,6 +79,53 @@ def _grammar_fingerprint() -> str:
     _GRAMMAR_FINGERPRINT_CACHE = digest[:12]
     return _GRAMMAR_FINGERPRINT_CACHE
 
+# A CHECKOUT IS NOT A RELEASE. The namespacing above rests on «a version means an
+# extractor», which holds for an installed wheel and fails for a source checkout:
+# `uv tool install --editable` is how this repo is developed, and there the extractor
+# changes many times under one version that never moves. Every AST entry written by
+# yesterday's extractor is then served to today's, so a fix to an extractor reads as
+# having done nothing at all — measured 2026-09-13, when a C# recovery landed and the
+# graph did not move until `cache/ast/` was deleted by hand, and `update --force` does
+# not do that (its --force is about the node-count guard, not the cache).
+#
+# So in a checkout the version segment carries a fingerprint of the extractor sources.
+# Contents, not mtimes: switching branches rewrites mtimes without changing code, and
+# a rebuild of an identical tree should hit the cache. 32 files, 1.3 MB, 2.5 ms, once
+# per process. In a released install the fingerprint is empty and nothing changes —
+# there the files cannot move under the version.
+#
+# `_cleanup_stale_ast_entries` already sweeps sibling `v*/` directories, so each new
+# fingerprint retires the previous one instead of piling up.
+_SOURCE_FINGERPRINT: str | None = None
+
+
+def _extractor_fingerprint(package: Path | None = None) -> str:
+    """``+<12 hex>`` for a source checkout, ``""`` for an installed release.
+
+    ``package`` overrides the package directory, for tests; only the real one is
+    memoised, since that is the one asked for on every ``cache_dir`` call.
+    """
+    global _SOURCE_FINGERPRINT
+    memoise = package is None
+    if memoise and _SOURCE_FINGERPRINT is not None:
+        return _SOURCE_FINGERPRINT
+    root = package if package is not None else Path(__file__).resolve().parent
+    fingerprint = ""
+    try:
+        if (root.parent / ".git").exists():
+            digest = hashlib.sha256()
+            sources = [root / "extract.py", *sorted((root / "extractors").glob("*.py"))]
+            for source in sources:
+                digest.update(source.read_bytes())
+            fingerprint = "+" + digest.hexdigest()[:12]
+    except OSError:
+        # Unreadable sources are not a reason to fail a run; fall back to the version
+        # alone, which is what a release does anyway.
+        fingerprint = ""
+    if memoise:
+        _SOURCE_FINGERPRINT = fingerprint
+    return fingerprint
+
 # Version dirs already swept this process — cleanup runs once per (base, version).
 _cleaned_ast_dirs: set[str] = set()
 
@@ -1035,9 +1082,11 @@ def cache_dir(root: Path = Path("."), kind: str = "ast",
     "semantic-deep" (#1894). Separate subdirectories prevent semantic cache
     entries from overwriting AST cache entries for the same source_file (#582).
 
-    AST entries live in graphify-out/cache/ast/v{version}-s{schema}-g{grammars}/, namespaced
-    by graphify version, cache-key schema, and tree-sitter grammar set because they depend on extractor
-    code and key semantics, not just file contents. Semantic entries are still
+    AST entries live in graphify-out/cache/ast/v{version}[+{fingerprint}]-s{schema}-g{grammars}/,
+    namespaced by graphify version, cache-key schema, and tree-sitter grammar set because
+    they depend on extractor code and key semantics, not just file contents — and, in a
+    source checkout where the version does not move between edits, by a fingerprint of the
+    extractor sources (see :func:`_extractor_fingerprint`). Semantic entries are still
     NOT version-namespaced (re-extraction
     costs LLM calls, #1252): they live in graphify-out/cache/semantic/, with
     deep-mode entries beside them in graphify-out/cache/semantic-deep/.
@@ -1051,7 +1100,7 @@ def cache_dir(root: Path = Path("."), kind: str = "ast",
     base = _out if _out.is_absolute() else Path(root).resolve() / _out
     d = base / "cache" / kind
     if kind == "ast":
-        d = d / f"v{_EXTRACTOR_VERSION}-s{_AST_CACHE_SCHEMA}-g{_grammar_fingerprint()}"
+        d = d / f"v{_EXTRACTOR_VERSION}{_extractor_fingerprint()}-s{_AST_CACHE_SCHEMA}-g{_grammar_fingerprint()}"
         _cleanup_stale_ast_entries(d.parent, d)
     elif prompt_fp:
         d = d / f"p{prompt_fp}"
