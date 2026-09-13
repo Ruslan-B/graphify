@@ -6129,7 +6129,11 @@ def _extract_generic(
             # The walk is over but `scope_stack` is not empty, and `add_node` would
             # stamp its leftovers on a declaration that was never inside them. A
             # recovered node's scope chain is not known, so say so rather than lie.
-            _meta: dict = {"scope_chain": []}
+            # `recovered` is the node's own warning to every reader: its edges were never
+            # extracted, so «no arrows» here means «arrows unknown», not «not connected».
+            # Without it a 229-line composition root draws as an isolated box and reads
+            # as dead code — the same lie a suppressed hub tells, in another dress.
+            _meta: dict = {"scope_chain": [], "recovered": True}
             if _ns:
                 _meta["namespace"] = _ns
             if _decl["parent"]:

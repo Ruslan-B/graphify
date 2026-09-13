@@ -139,3 +139,25 @@ def test_a_bodyless_declaration_does_not_swallow_the_next_block() -> None:
     """`record R(int X);` ends at the semicolon — the block after it is not its body."""
     source = "namespace N;\nrecord R(int X);\nclass After\n{\n    class Inside { }\n}\n"
     assert _types(source) == {("R", "N", ""), ("After", "N", ""), ("Inside", "N", "After")}
+
+
+def test_a_recovered_type_says_so(tmp_path: Path) -> None:
+    """Its edges were never extracted. A reader that cannot tell «no edges» from «edges
+    unknown» draws the biggest class in a project as an isolated box."""
+    path = tmp_path / "CommandLine.cs"
+    path.write_text(SLICE_PATTERN, encoding="utf-8")
+
+    result = extract_csharp(path)
+
+    recovered = next(n for n in result["nodes"] if n["label"] == "CommandLine")
+    assert recovered["metadata"]["recovered"] is True
+
+
+def test_a_type_the_walk_reached_does_not(tmp_path: Path) -> None:
+    path = tmp_path / "Clean.cs"
+    path.write_text("namespace N;\n\npublic sealed class Clean\n{\n    public int M() => 1;\n}\n", encoding="utf-8")
+
+    result = extract_csharp(path)
+
+    clean = next(n for n in result["nodes"] if n["label"] == "Clean")
+    assert "recovered" not in (clean.get("metadata") or {})
