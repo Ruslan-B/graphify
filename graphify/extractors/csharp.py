@@ -446,3 +446,183 @@ def _resolve_csharp_type_references(
         node for node in all_nodes
         if node.get("id") not in repointed_from or node.get("id") in still_referenced
     ]
+
+
+# ── Recovery from a parse the grammar could not complete ─────────────────────
+#
+# A C# file must not vanish from the graph because of one construct the grammar
+# does not know yet. Measured 2026-09-13 on tree-sitter-c-sharp 0.23.5, which is
+# the NEWEST release on PyPI (0.21.2, 0.21.3, 0.23.0, 0.23.1, 0.23.4, 0.23.5), so
+# this is not a version to bump past: the SLICE pattern `..` fails to parse.
+#
+#     r is ["--lang", var c]        parses
+#     r is []                       parses
+#     r is { Length: 1 }            parses
+#     r is [.. var rest]            ERROR
+#     r is ["--lang", var c, .. r]  ERROR
+#
+# One such line, at line 56 of a 229-line file, put an ERROR node over the file
+# from line 1 and the whole file contributed a single symbol — its own file node.
+# Every type in it, and every edge into those types, was simply absent, and the
+# only trace was one warning line.
+#
+# `extractors/sql.py` has carried a regex recovery for exactly this shape of
+# problem since #2180, and `blade.py` is regex from end to end; this is the C#
+# one. It recovers TYPE DECLARATIONS only, on purpose: a regex can see that
+# `class Foo` is declared and cannot see what `Foo.Bar()` resolves to, and a
+# graph is better missing an edge than carrying an invented one.
+import re
+
+# Strings and comments are blanked before the scan: `// class Ghost` and
+# `"class Ghost"` must not mint a type. Kept as a linear scanner rather than one
+# regex because the span kinds interact — a quote inside a comment opens nothing,
+# and C# has four string forms with different escapes.
+#
+#   "…"      ordinary, backslash escapes, ends at end of line if unclosed
+#   @"…"     verbatim, spans lines, a doubled "" is one quote
+#   """…"""  raw (C# 11), spans lines, any run of 3+ quotes opens and closes
+#   '…'      char, backslash escapes
+#
+# Interpolation (`$"…{Expr}…"`) is blanked whole: a type cannot be declared
+# inside an interpolation hole, so nothing recoverable is lost.
+def _mask_csharp(source: str) -> str:
+    out = list(source)
+    n = len(source)
+    i = 0
+
+    def blank(start: int, end: int) -> None:
+        for k in range(start, min(end, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    while i < n:
+        ch = source[i]
+        if ch == "/" and i + 1 < n and source[i + 1] == "/":
+            j = source.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+        elif ch == "/" and i + 1 < n and source[i + 1] == "*":
+            j = source.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            blank(i, j)
+            i = j
+        elif ch == '"' and source.startswith('"""', i):
+            fence = len(source) - len(source[i:].lstrip('"'))
+            quotes = '"' * fence
+            j = source.find(quotes, i + fence)
+            j = n if j < 0 else j + fence
+            blank(i, j)
+            i = j
+        elif ch == "@" and i + 1 < n and source[i + 1] == '"':
+            j = i + 2
+            while j < n:
+                if source[j] == '"':
+                    if j + 1 < n and source[j + 1] == '"':
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            blank(i, j)
+            i = j
+        elif ch in '"\'':
+            j = i + 1
+            while j < n and source[j] != ch and source[j] != "\n":
+                j += 2 if source[j] == "\\" else 1
+            j = min(j + 1, n)
+            blank(i, j)
+            i = j
+        else:
+            i += 1
+    return "".join(out)
+
+
+# `record class X` / `record struct X` name the same declaration twice — once as
+# `record`, once as `class` — and both matches carry the same name and line, so
+# they mint one id and `add_node` drops the second in silence. Nothing to guard.
+_CSHARP_TYPE_RX = re.compile(
+    r"\b(?P<kind>class|struct|interface|enum|record)\s+"
+    r"(?:(?:class|struct)\s+)?"
+    r"(?P<name>[A-Za-z_]\w*)"
+)
+_CSHARP_NAMESPACE_RX = re.compile(
+    r"\bnamespace\s+(?P<name>[A-Za-z_][\w.]*)\s*(?P<open>[;{])"
+)
+
+
+def recover_csharp_types(source: str) -> list[dict]:
+    """Type declarations a regex can see, for a file the parser could not finish.
+
+    Returns ``{"name", "namespace", "line", "parent"}`` per declaration, in the
+    order they appear. ``namespace`` is the enclosing namespace — file-scoped
+    (`namespace X;`) and block (`namespace X { }`) both, nested ones joined with
+    dots. ``parent`` is the enclosing TYPE's name, empty at the top level: it is
+    both the `is_nested_type` mark and the node to hang the containment edge on,
+    and a type id carries no parent name, so the caller can rebuild it.
+    """
+    masked = _mask_csharp(source)
+    starts = [0]
+    for index, char in enumerate(masked):
+        if char == "\n":
+            starts.append(index + 1)
+
+    def line_of(position: int) -> int:
+        low, high = 0, len(starts) - 1
+        while low < high:
+            mid = (low + high + 1) // 2
+            if starts[mid] <= position:
+                low = mid
+            else:
+                high = mid - 1
+        return low + 1
+
+    events: list[tuple[int, int, str, object]] = []
+    for match in _CSHARP_NAMESPACE_RX.finditer(masked):
+        events.append((match.start(), 0, "namespace", match))
+    for match in _CSHARP_TYPE_RX.finditer(masked):
+        events.append((match.start(), 0, "type", match))
+    for index, char in enumerate(masked):
+        if char in "{};":
+            events.append((index, 1, char, None))
+    events.sort(key=lambda event: (event[0], event[1]))
+
+    found: list[dict] = []
+    stack: list[tuple[str, str]] = []
+    pending: tuple[str, str] | None = None
+    file_namespace = ""
+
+    for position, _, kind, match in events:
+        if kind == "namespace":
+            name = match.group("name")  # type: ignore[union-attr]
+            if match.group("open") == ";":  # type: ignore[union-attr]
+                file_namespace = name
+            else:
+                pending = ("namespace", name)
+        elif kind == "type":
+            name = match.group("name")  # type: ignore[union-attr]
+            namespaces = [part for part in (file_namespace,) if part]
+            namespaces += [value for frame, value in stack if frame == "namespace"]
+            found.append({
+                "name": name,
+                "namespace": ".".join(namespaces),
+                "line": line_of(position),
+                "parent": next(
+                    (value for frame, value in reversed(stack) if frame == "type"), ""
+                ),
+            })
+            pending = ("type", name)
+        elif kind == "{":
+            # An unnamed block — a method body, an initializer — is pushed too, so a
+            # type declared inside one still counts as nested and `}` stays balanced.
+            stack.append(pending or ("block", ""))
+            pending = None
+        elif kind == "}":
+            if stack:
+                stack.pop()
+        elif kind == ";":
+            # `record Point(int X, int Y);` and `enum E;` declare with no body: the
+            # declaration is over, so it must not swallow the next block.
+            pending = None
+
+    return found

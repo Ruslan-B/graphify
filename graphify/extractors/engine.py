@@ -6104,6 +6104,43 @@ def _extract_generic(
 
         _scan_js_module_dispatch(root)
 
+    # ── Recover what a failed parse lost (C#) ─────────────────────────────────
+    #
+    # Before the edges are cleaned, not after: `clean_edges` is built once from
+    # `edges` against `valid_ids`, so a node added later still counts (the set is
+    # shared) while an EDGE added later is appended to a list nobody reads again.
+    if root.has_error and config.ts_module == "tree_sitter_c_sharp":
+        # One construct the grammar does not know — measured 2026-09-13, the slice
+        # pattern `..`, which
+        # tree-sitter-c-sharp 0.23.5 (the newest release there is) cannot parse — puts
+        # an ERROR node over the whole file, and every type in it leaves the graph with
+        # a single warning line as the only trace. `recover_csharp_types` reads the
+        # declarations out of the masked source; `add_node` dedupes by id, so whatever
+        # the walk DID reach is kept and only the missing ones are added. Types only:
+        # a regex can see that `class Foo` is declared and cannot see what a call in it
+        # resolves to, and a graph is better missing an edge than carrying an invented one.
+        from graphify.extractors.csharp import recover_csharp_types
+
+        for _decl in recover_csharp_types(source.decode("utf-8", "replace")):
+            _ns = _decl["namespace"]
+            _nid = _make_id(stem, _ns, _decl["name"])
+            if _nid in seen_ids:
+                continue
+            # The walk is over but `scope_stack` is not empty, and `add_node` would
+            # stamp its leftovers on a declaration that was never inside them. A
+            # recovered node's scope chain is not known, so say so rather than lie.
+            _meta: dict = {"scope_chain": []}
+            if _ns:
+                _meta["namespace"] = _ns
+            if _decl["parent"]:
+                _meta["is_nested_type"] = True
+            add_node(_nid, _decl["name"], _decl["line"], metadata=_meta or None)
+            callable_def_nids.add(_nid)
+            callable_class_nids.add(_nid)
+            _parent_nid = _make_id(stem, _ns, _decl["parent"]) if _decl["parent"] else None
+            _owner = _parent_nid if _parent_nid in seen_ids else file_nid
+            add_edge(_owner, _nid, "contains", _decl["line"])
+
     # ── Clean edges ───────────────────────────────────────────────────────────
     valid_ids = seen_ids
     clean_edges = []
