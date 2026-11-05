@@ -18,7 +18,9 @@ def test_ast_cache_dir_is_grammar_namespaced(tmp_path, monkeypatch):
     monkeypatch.setattr(cache_mod, "_GRAPHIFY_OUT", str(tmp_path / "out"))
     d = cache_mod.cache_dir(tmp_path, kind="ast")
     name = d.name
-    assert name.startswith(f"v{cache_mod._EXTRACTOR_VERSION}-s{cache_mod._AST_CACHE_SCHEMA}-g"), name
+    assert name.startswith(
+        f"v{cache_mod._EXTRACTOR_VERSION}{cache_mod._extractor_fingerprint()}-s{cache_mod._AST_CACHE_SCHEMA}-g"
+    ), name
     assert name.endswith(cache_mod._grammar_fingerprint()), name
 
 
